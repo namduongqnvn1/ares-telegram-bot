@@ -1,0 +1,11 @@
+services:
+  - type: worker
+    name: ares-telegram-report-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: DRY_RUN
+        value: "true"
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
