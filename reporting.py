@@ -318,16 +318,25 @@ class SheetsWriter:
         return f"Tháng {report.month}/{report.year}"
 
     def _find_row(self, report: Report):
+        from googleapiclient.errors import HttpError
+
         title = self._sheet_title(report)
-        result = self.service.spreadsheets().values().get(
-            spreadsheetId=self.spreadsheet_id,
-            range=f"'{title}'!A5:A40",
-            valueRenderOption="FORMATTED_VALUE",
-        ).execute()
+        try:
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"'{title}'!A5:A40",
+                valueRenderOption="FORMATTED_VALUE",
+            ).execute()
+        except HttpError as exc:
+            raise ReportError(
+                f"Không đọc được ngày báo cáo chính xác (sheet {title} không tồn tại, có thể AI đọc nhầm ngày)"
+            ) from exc
         for offset, values in enumerate(result.get("values", []), start=5):
             if values and str(values[0]).strip() == report.report_date:
                 return title, offset
-        raise ReportError(f"Không tìm thấy ngày {report.report_date} trong sheet {title}")
+        raise ReportError(
+            f"Không đọc được ngày báo cáo khớp với Sheet (không thấy {report.report_date} trong sheet {title})"
+        )
 
     @staticmethod
     def _number(value):
