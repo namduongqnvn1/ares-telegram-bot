@@ -89,6 +89,7 @@ Trả về DUY NHẤT một JSON object theo mẫu:
 Quy tắc:
 - Các số trên phiếu có đơn vị nghìn đồng. JSON phải là số tiền VND đầy đủ; ví dụ 3918 thành 3918000.
 - report_date lấy từ dòng BÁO CÁO NGÀY ... THÁNG ...; năm hiện hành là 2026 nếu ảnh không ghi năm.
+- Nếu ngày hoặc tháng viết tay không đọc được chắc chắn, đặt report_date là null. TUYỆT ĐỐI không suy đoán ngày.
 - fnet_total là ô Tổng của dòng Fnet.
 - ffood_total là ô Tổng của dòng Ffood.
 - transfer_total là ô Tổng của dòng Tiền chuyển khoản.
@@ -183,7 +184,8 @@ def parse_report_payload(data: dict) -> Report:
             continue
         warnings.append(warning)
 
-    if confidence < 0.8:
+    min_confidence = float(os.environ.get("MIN_CONFIDENCE", "0.8"))
+    if confidence < min_confidence:
         raise ReportError("Ảnh cần kiểm tra thủ công: " + "; ".join(warnings or ["độ tin cậy thấp"]))
 
     return Report(
