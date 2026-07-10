@@ -133,7 +133,7 @@ def parse_manual_correction(text, pending=None):
     column_patterns = {
         "machine_revenue": r"\b(dt\s*may|fnet)\b",
         "service_revenue": r"\b(dt\s*dich\s*vu|ffood|dich\s*vu)\b",
-        "cash": r"\b(tien\s*mat|cash|con)\b",
+        "cash": r"\b(tien\s*mat|cash|con|tm)\b",
         "momo": r"\b(momo|mo\s*mo|chuyen\s*khoan|bank|ck)\b",
     }
     field = None
@@ -165,6 +165,17 @@ def parse_manual_correction(text, pending=None):
     if field is None:
         return None
     return field, value
+
+
+def parse_manual_corrections(text, pending=None):
+    """Cho phép sửa nhiều cột trong một tin nhắn, ví dụ: momo 2.094.000, tm 1.944.000"""
+    corrections = {}
+    for segment in re.split(r"[,;\n]+", text or ""):
+        parsed = parse_manual_correction(segment, pending)
+        if parsed:
+            field, value = parsed
+            corrections[field] = value
+    return corrections
 
 
 def pick_image(message):
@@ -219,6 +230,7 @@ def write_report_from_image(bot, chat_id, extractor, writer, done_file_ids, file
         done_file_ids.append(unique_id)
         del done_file_ids[:-300]
     bot.send_message(chat_id, format_success(report, result, dry_run))
+    return report
 
 
 def process_message(bot, message, extractor, writer, done_file_ids, pending_by_chat):
@@ -230,22 +242,26 @@ def process_message(bot, message, extractor, writer, done_file_ids, pending_by_c
 
     raw_text = (message.get("text") or "").strip()
     text = raw_text.lower()
-    manual_correction = parse_manual_correction(raw_text, pending_by_chat.get(chat_key))
-    if manual_correction and chat_key in pending_by_chat:
+    manual_corrections = parse_manual_corrections(raw_text, pending_by_chat.get(chat_key))
+    if manual_corrections and chat_key in pending_by_chat:
         pending = pending_by_chat[chat_key]
         if pending.get("type") not in {"conflict", "manual"}:
             bot.send_message(chat_id, "Tao nhận được số sửa, nhưng ảnh đang chờ không phải lỗi số liệu.")
             return
-        field, value = manual_correction
         report = report_from_dict(pending["report"])
-        report = replace(report, **{field: value})
+        report = replace(report, **manual_corrections)
         dry_run = dry_run_enabled()
         result = writer.write(report, dry_run=dry_run, overwrite=True)
         unique_id = pending.get("unique_id")
         if unique_id and not dry_run:
             done_file_ids.append(unique_id)
             del done_file_ids[:-300]
-        del pending_by_chat[chat_key]
+        pending_by_chat[chat_key] = {
+            "type": "manual",
+            "report": report.to_dict(),
+            "unique_id": unique_id,
+            "created_at": int(time.time()),
+        }
         bot.send_message(chat_id, format_success(report, result, dry_run))
         return
 
@@ -261,19 +277,28 @@ def process_message(bot, message, extractor, writer, done_file_ids, pending_by_c
         if unique_id and not dry_run:
             done_file_ids.append(unique_id)
             del done_file_ids[:-300]
-        del pending_by_chat[chat_key]
+        pending_by_chat[chat_key] = {
+            "type": "manual",
+            "report": report.to_dict(),
+            "unique_id": unique_id,
+            "created_at": int(time.time()),
+        }
         bot.send_message(chat_id, format_success(report, result, dry_run))
         return
 
     date_hint = parse_date_hint(raw_text)
-    if date_hint and chat_key in pending_by_chat:
+    if (
+        date_hint
+        and chat_key in pending_by_chat
+        and pending_by_chat[chat_key].get("type") == "missing_date"
+    ):
         pending = pending_by_chat[chat_key]
         if pending.get("unique_id") and pending["unique_id"] in done_file_ids:
             del pending_by_chat[chat_key]
             bot.send_message(chat_id, "Ảnh đang chờ này đã được xử lý rồi, tao bỏ qua để tránh trùng.")
             return
         bot.send_message(chat_id, f"Đã nhận ngày {date_hint}, tao xử lý lại ảnh vừa rồi...")
-        write_report_from_image(
+        report = write_report_from_image(
             bot,
             chat_id,
             extractor,
@@ -283,7 +308,12 @@ def process_message(bot, message, extractor, writer, done_file_ids, pending_by_c
             pending.get("unique_id"),
             date_hint=date_hint,
         )
-        del pending_by_chat[chat_key]
+        pending_by_chat[chat_key] = {
+            "type": "manual",
+            "report": report.to_dict(),
+            "unique_id": pending.get("unique_id"),
+            "created_at": int(time.time()),
+        }
         return
 
     if text in {"/start", "/help"}:
@@ -306,8 +336,13 @@ def process_message(bot, message, extractor, writer, done_file_ids, pending_by_c
 
     bot.send_message(chat_id, "Đã nhận ảnh, tao đang đọc số liệu...")
     try:
-        write_report_from_image(bot, chat_id, extractor, writer, done_file_ids, file_id, unique_id)
-        pending_by_chat.pop(chat_key, None)
+        report = write_report_from_image(bot, chat_id, extractor, writer, done_file_ids, file_id, unique_id)
+        pending_by_chat[chat_key] = {
+            "type": "manual",
+            "report": report.to_dict(),
+            "unique_id": unique_id,
+            "created_at": int(time.time()),
+        }
     except ReportError as exc:
         if is_missing_date_error(exc):
             pending_by_chat[chat_key] = {

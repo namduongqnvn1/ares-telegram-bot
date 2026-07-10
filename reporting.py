@@ -98,7 +98,7 @@ Quy tắc:
 - cash_remaining là số cạnh chữ Còn ở cột phải. Nếu không có số Còn thì để null.
 - Cột Google Sheet cần ghi: DT máy = Fnet tổng; DT dịch vụ = Ffood tổng; Tiền mặt = Còn nếu có, nếu không dùng Tiền mặt tổng; MoMo = chuyển khoản tổng.
 - Không lấy nhầm Tổng tiền máy, Tổng tiền thực tế, tồn kho hoặc suy diễn số bị che.
-- Chỉ cần đọc các ô Tổng/cột phải theo quy tắc trên. Không tự cộng 3 ca để tạo cảnh báo.
+- Luôn đọc cả các ô theo từng ca. Nếu một ô Tổng bị mờ hoặc có nhiều cách đọc (ví dụ 2094 hay 2594), hãy cộng các ô ca trong cùng dòng đó và CHỌN cách đọc khớp với tổng các ca. Chỉ ghi cảnh báo nếu sau khi đối chiếu vẫn không chắc chắn.
 - Nếu không chắc trường bắt buộc, đặt confidence dưới 0.8 và mô tả trong warnings.
 """
 
@@ -174,15 +174,7 @@ def parse_report_payload(data: dict) -> Report:
     cash_total = _money(data.get("cash_total"), "tiền mặt")
     cash_remaining = _money(data.get("cash_remaining"), "số Còn", optional=True)
     confidence = float(data.get("confidence", 0))
-    warnings = []
-    for item in data.get("warnings", []):
-        warning = str(item)
-        lowered = warning.lower()
-        if "shift" in lowered and "sum" in lowered:
-            continue
-        if "tổng 3 ca" in lowered:
-            continue
-        warnings.append(warning)
+    warnings = [str(item) for item in data.get("warnings", [])]
 
     min_confidence = float(os.environ.get("MIN_CONFIDENCE", "0.8"))
     if confidence < min_confidence:
