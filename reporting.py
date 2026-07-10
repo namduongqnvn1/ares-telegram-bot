@@ -239,7 +239,7 @@ class GeminiExtractor:
 class ClaudeExtractor:
     def __init__(self, api_key=None, model=None):
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-        self.model = model or os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+        self.model = model or os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8")
         if not self.api_key:
             raise ReportError("Thiếu ANTHROPIC_API_KEY")
 
@@ -248,7 +248,6 @@ class ClaudeExtractor:
         payload = {
             "model": self.model,
             "max_tokens": 1200,
-            "temperature": 0,
             "messages": [{
                 "role": "user",
                 "content": [
