@@ -19,6 +19,36 @@ class ReportError(Exception):
     pass
 
 
+class SheetConflictError(ReportError):
+    def __init__(self, report: "Report", sheet: str, row: int, conflicts: dict):
+        self.report = report
+        self.sheet = sheet
+        self.row = row
+        self.conflicts = conflicts
+        super().__init__(self._format_message())
+
+    @staticmethod
+    def _label(column):
+        return {
+            "B": "DT máy",
+            "C": "DT dịch vụ",
+            "E": "Tiền mặt",
+            "F": "MoMo",
+        }.get(column, column)
+
+    @staticmethod
+    def _money(value):
+        return f"{value:,}".replace(",", ".")
+
+    def _format_message(self):
+        parts = []
+        for column, values in self.conflicts.items():
+            parts.append(
+                f"{self._label(column)} đang có {self._money(values['current'])}, ảnh đọc ra {self._money(values['new'])}"
+            )
+        return "Dữ liệu đã có và khác ảnh: " + "; ".join(parts)
+
+
 @dataclass(frozen=True)
 class Report:
     report_date: str
@@ -70,6 +100,17 @@ Quy tắc:
 - Chỉ cần đọc các ô Tổng/cột phải theo quy tắc trên. Không tự cộng 3 ca để tạo cảnh báo.
 - Nếu không chắc trường bắt buộc, đặt confidence dưới 0.8 và mô tả trong warnings.
 """
+
+
+def build_prompt(date_hint: str | None = None) -> str:
+    if not date_hint:
+        return PROMPT
+    return (
+        PROMPT
+        + "\nBổ sung từ người dùng: ngày báo cáo chắc chắn là "
+        + date_hint
+        + ". Hãy dùng đúng giá trị này cho report_date, không cần đọc lại ngày trên ảnh.\n"
+    )
 
 
 def prepare_report_image(image_bytes: bytes, mime_type: str):
@@ -163,12 +204,12 @@ class GeminiExtractor:
         if not self.api_key:
             raise ReportError("Thiếu GEMINI_API_KEY")
 
-    def extract(self, image_bytes: bytes, mime_type: str) -> Report:
+    def extract(self, image_bytes: bytes, mime_type: str, date_hint: str | None = None) -> Report:
         image_bytes, mime_type = prepare_report_image(image_bytes, mime_type)
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
         payload = {
             "contents": [{"parts": [
-                {"text": PROMPT},
+                {"text": build_prompt(date_hint)},
                 {"inlineData": {
                     "mimeType": mime_type,
                     "data": base64.b64encode(image_bytes).decode("ascii"),
@@ -189,7 +230,60 @@ class GeminiExtractor:
             text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError, TypeError) as exc:
             raise ReportError("Không lấy được kết quả từ Gemini") from exc
-        return parse_report_payload(_extract_json(text))
+        data = _extract_json(text)
+        if date_hint:
+            data["report_date"] = date_hint
+        return parse_report_payload(data)
+
+
+class ClaudeExtractor:
+    def __init__(self, api_key=None, model=None):
+        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        self.model = model or os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+        if not self.api_key:
+            raise ReportError("Thiếu ANTHROPIC_API_KEY")
+
+    def extract(self, image_bytes: bytes, mime_type: str, date_hint: str | None = None) -> Report:
+        image_bytes, mime_type = prepare_report_image(image_bytes, mime_type)
+        payload = {
+            "model": self.model,
+            "max_tokens": 1200,
+            "temperature": 0,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": build_prompt(date_hint)},
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": mime_type,
+                        "data": base64.b64encode(image_bytes).decode("ascii"),
+                    }},
+                ],
+            }],
+        }
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        response = None
+        for attempt in range(4):
+            response = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload, timeout=90)
+            if response.status_code not in {429, 500, 502, 503, 504}:
+                break
+            if attempt < 3:
+                time.sleep(2 ** attempt)
+        if response.status_code >= 400:
+            raise ReportError(f"Claude lỗi HTTP {response.status_code}: {response.text[:200]}")
+        try:
+            parts = response.json()["content"]
+            text = "\n".join(part.get("text", "") for part in parts if part.get("type") == "text")
+        except (KeyError, TypeError) as exc:
+            raise ReportError("Không lấy được kết quả từ Claude") from exc
+        data = _extract_json(text)
+        if date_hint:
+            data["report_date"] = date_hint
+        return parse_report_payload(data)
 
 
 class SheetsWriter:
@@ -240,7 +334,7 @@ class SheetsWriter:
             return None
         return int(float(str(value).replace(".", "").replace(",", "")))
 
-    def write(self, report: Report, dry_run=True):
+    def write(self, report: Report, dry_run=True, overwrite=False):
         title, row = self._find_row(report)
         current = self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
@@ -260,8 +354,8 @@ class SheetsWriter:
             old = self._number(cells[indexes[column]])
             if old not in (None, 0, value):
                 conflicts[column] = {"current": old, "new": value}
-        if conflicts:
-            raise ReportError(f"Dữ liệu đã có và khác ảnh: {conflicts}")
+        if conflicts and not overwrite:
+            raise SheetConflictError(report, title, row, conflicts)
         if dry_run:
             return {"status": "dry_run", "sheet": title, "row": row, "values": desired}
 

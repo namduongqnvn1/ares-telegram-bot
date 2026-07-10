@@ -1,14 +1,18 @@
 import json
 import mimetypes
 import os
+import re
 import time
 import traceback
+import unicodedata
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 
-from reporting import GeminiExtractor, ReportError, SheetsWriter
+from reporting import ClaudeExtractor, GeminiExtractor, Report, ReportError, SheetConflictError, SheetsWriter
 
 
 class TelegramBot:
@@ -69,6 +73,100 @@ def dry_run_enabled():
     return str(os.environ.get("DRY_RUN", "true")).lower() in {"1", "true", "yes", "on"}
 
 
+def create_extractor():
+    provider = os.environ.get("AI_PROVIDER", "gemini").strip().lower()
+    if provider in {"claude", "anthropic"}:
+        return ClaudeExtractor()
+    return GeminiExtractor()
+
+
+def parse_date_hint(text):
+    match = re.search(r"(?:ngày\s*)?(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?", text, flags=re.I)
+    if not match:
+        return None
+    day = int(match.group(1))
+    month = int(match.group(2))
+    raw_year = match.group(3)
+    year = datetime.now().year if not raw_year else int(raw_year)
+    if year < 100:
+        year += 2000
+    try:
+        return datetime(year, month, day).strftime("%d/%m/%Y")
+    except ValueError:
+        return None
+
+
+def is_missing_date_error(exc):
+    return "ngày báo cáo" in str(exc).lower()
+
+
+def report_from_dict(data):
+    return Report(
+        report_date=data["report_date"],
+        machine_revenue=int(data["machine_revenue"]),
+        service_revenue=int(data["service_revenue"]),
+        cash=int(data["cash"]),
+        momo=int(data["momo"]),
+        confidence=float(data.get("confidence", 1)),
+        warnings=tuple(data.get("warnings", [])),
+    )
+
+
+def normalize_money(raw):
+    digits = re.sub(r"\D", "", raw or "")
+    if not digits:
+        return None
+    value = int(digits)
+    if value < 100_000:
+        value *= 1000
+    return value
+
+
+def strip_accents(text):
+    text = unicodedata.normalize("NFD", text or "")
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    return text.replace("đ", "d").replace("Đ", "D")
+
+
+def parse_manual_correction(text, pending=None):
+    normalized = strip_accents(text).lower()
+    column_patterns = {
+        "machine_revenue": r"\b(dt\s*may|fnet)\b",
+        "service_revenue": r"\b(dt\s*dich\s*vu|ffood|dich\s*vu)\b",
+        "cash": r"\b(tien\s*mat|cash|con)\b",
+        "momo": r"\b(momo|mo\s*mo|chuyen\s*khoan|bank|ck)\b",
+    }
+    field = None
+    for candidate, pattern in column_patterns.items():
+        if re.search(pattern, normalized, flags=re.I):
+            field = candidate
+            break
+
+    money_matches = re.findall(r"\d[\d.,]*", text)
+    value = None
+    for match in reversed(money_matches):
+        parsed = normalize_money(match)
+        if parsed and parsed >= 100_000:
+            value = parsed
+            break
+    if value is None:
+        return None
+
+    if field is None and pending and pending.get("type") == "conflict":
+        conflicts = pending.get("conflicts", {})
+        if len(conflicts) == 1:
+            only_column = next(iter(conflicts))
+            field = {
+                "B": "machine_revenue",
+                "C": "service_revenue",
+                "E": "cash",
+                "F": "momo",
+            }.get(only_column)
+    if field is None:
+        return None
+    return field, value
+
+
 def pick_image(message):
     if message.get("photo"):
         photo = message["photo"][-1]
@@ -101,13 +199,93 @@ def format_success(report, result, dry_run):
     )
 
 
-def process_message(bot, message, extractor, writer, done_file_ids):
+def format_conflict_prompt(exc):
+    return (
+        f"⚠️ <b>Dữ liệu trong Sheet đã có và khác ảnh</b>\n"
+        f"Ngày: <b>{exc.report.report_date}</b>\n"
+        f"Sheet: <b>{exc.sheet}</b>, dòng <b>{exc.row}</b>\n\n"
+        f"{exc}\n\n"
+        f"Nếu ảnh mới đúng và muốn thay số cũ, trả lời: <b>ghi đè</b>\n"
+        f"Nếu AI đọc sai, trả lời kiểu: <b>MoMo 1.768.000</b> hoặc <b>Tiền mặt 3.843.000</b>"
+    )
+
+
+def write_report_from_image(bot, chat_id, extractor, writer, done_file_ids, file_id, unique_id, date_hint=None, overwrite=False):
+    image_bytes, mime_type = bot.download_file(file_id)
+    report = extractor.extract(image_bytes, mime_type, date_hint=date_hint)
+    dry_run = dry_run_enabled()
+    result = writer.write(report, dry_run=dry_run, overwrite=overwrite)
+    if unique_id and not dry_run:
+        done_file_ids.append(unique_id)
+        del done_file_ids[:-300]
+    bot.send_message(chat_id, format_success(report, result, dry_run))
+
+
+def process_message(bot, message, extractor, writer, done_file_ids, pending_by_chat):
     chat_id = message["chat"]["id"]
+    chat_key = str(chat_id)
     if not bot.is_allowed(chat_id):
         bot.send_message(chat_id, "⛔ Chat này chưa được phép dùng bot.")
         return
 
-    text = (message.get("text") or "").strip().lower()
+    raw_text = (message.get("text") or "").strip()
+    text = raw_text.lower()
+    manual_correction = parse_manual_correction(raw_text, pending_by_chat.get(chat_key))
+    if manual_correction and chat_key in pending_by_chat:
+        pending = pending_by_chat[chat_key]
+        if pending.get("type") not in {"conflict", "manual"}:
+            bot.send_message(chat_id, "Tao nhận được số sửa, nhưng ảnh đang chờ không phải lỗi số liệu.")
+            return
+        field, value = manual_correction
+        report = report_from_dict(pending["report"])
+        report = replace(report, **{field: value})
+        dry_run = dry_run_enabled()
+        result = writer.write(report, dry_run=dry_run, overwrite=True)
+        unique_id = pending.get("unique_id")
+        if unique_id and not dry_run:
+            done_file_ids.append(unique_id)
+            del done_file_ids[:-300]
+        del pending_by_chat[chat_key]
+        bot.send_message(chat_id, format_success(report, result, dry_run))
+        return
+
+    if text in {"ghi đè", "ghi de", "overwrite", "cap nhat", "cập nhật"} and chat_key in pending_by_chat:
+        pending = pending_by_chat[chat_key]
+        if pending.get("type") != "conflict":
+            bot.send_message(chat_id, "Ảnh đang chờ không phải lỗi dữ liệu khác nhau, tao không ghi đè.")
+            return
+        report = report_from_dict(pending["report"])
+        dry_run = dry_run_enabled()
+        result = writer.write(report, dry_run=dry_run, overwrite=True)
+        unique_id = pending.get("unique_id")
+        if unique_id and not dry_run:
+            done_file_ids.append(unique_id)
+            del done_file_ids[:-300]
+        del pending_by_chat[chat_key]
+        bot.send_message(chat_id, format_success(report, result, dry_run))
+        return
+
+    date_hint = parse_date_hint(raw_text)
+    if date_hint and chat_key in pending_by_chat:
+        pending = pending_by_chat[chat_key]
+        if pending.get("unique_id") and pending["unique_id"] in done_file_ids:
+            del pending_by_chat[chat_key]
+            bot.send_message(chat_id, "Ảnh đang chờ này đã được xử lý rồi, tao bỏ qua để tránh trùng.")
+            return
+        bot.send_message(chat_id, f"Đã nhận ngày {date_hint}, tao xử lý lại ảnh vừa rồi...")
+        write_report_from_image(
+            bot,
+            chat_id,
+            extractor,
+            writer,
+            done_file_ids,
+            pending["file_id"],
+            pending.get("unique_id"),
+            date_hint=date_hint,
+        )
+        del pending_by_chat[chat_key]
+        return
+
     if text in {"/start", "/help"}:
         bot.send_message(
             chat_id,
@@ -117,21 +295,44 @@ def process_message(bot, message, extractor, writer, done_file_ids):
 
     file_id, unique_id, source = pick_image(message)
     if not file_id:
-        bot.send_message(chat_id, "Mày gửi/forward ảnh báo cáo vào đây là được.")
+        if date_hint:
+            bot.send_message(chat_id, "Tao nhận được ngày, nhưng hiện không có ảnh nào đang chờ bổ sung ngày.")
+        else:
+            bot.send_message(chat_id, "Mày gửi/forward ảnh báo cáo vào đây là được.")
         return
     if unique_id and unique_id in done_file_ids:
         bot.send_message(chat_id, "Ảnh này tao xử lý rồi, không ghi lại để tránh trùng.")
         return
 
     bot.send_message(chat_id, "Đã nhận ảnh, tao đang đọc số liệu...")
-    image_bytes, mime_type = bot.download_file(file_id)
-    report = extractor.extract(image_bytes, mime_type)
-    dry_run = dry_run_enabled()
-    result = writer.write(report, dry_run=dry_run)
-    if unique_id and not dry_run:
-        done_file_ids.append(unique_id)
-        del done_file_ids[:-300]
-    bot.send_message(chat_id, format_success(report, result, dry_run))
+    try:
+        write_report_from_image(bot, chat_id, extractor, writer, done_file_ids, file_id, unique_id)
+        pending_by_chat.pop(chat_key, None)
+    except ReportError as exc:
+        if is_missing_date_error(exc):
+            pending_by_chat[chat_key] = {
+                "type": "missing_date",
+                "file_id": file_id,
+                "unique_id": unique_id,
+                "source": source,
+                "created_at": int(time.time()),
+            }
+            bot.send_message(
+                chat_id,
+                "⚠️ Tao chưa đọc được ngày báo cáo. Mày trả lời ngày theo dạng <b>Ngày 8/7</b> hoặc <b>8/7/2026</b>, tao sẽ xử lý lại ảnh này.",
+            )
+            return
+        if isinstance(exc, SheetConflictError):
+            pending_by_chat[chat_key] = {
+                "type": "conflict",
+                "report": exc.report.to_dict(),
+                "conflicts": exc.conflicts,
+                "unique_id": unique_id,
+                "created_at": int(time.time()),
+            }
+            bot.send_message(chat_id, format_conflict_prompt(exc))
+            return
+        raise
 
 
 def main():
@@ -139,9 +340,10 @@ def main():
     state_path = Path(os.environ.get("STATE_FILE", ".ares-telegram-state.json"))
     state = load_state(state_path)
     bot = TelegramBot()
-    extractor = GeminiExtractor()
+    extractor = create_extractor()
     writer = SheetsWriter()
     done_file_ids = state.setdefault("done_file_ids", [])
+    pending_by_chat = state.setdefault("pending_by_chat", {})
 
     print("Ares Telegram bot đang chạy...", flush=True)
     while True:
@@ -154,7 +356,7 @@ def main():
                     save_state(state_path, state)
                     continue
                 try:
-                    process_message(bot, message, extractor, writer, done_file_ids)
+                    process_message(bot, message, extractor, writer, done_file_ids, pending_by_chat)
                 except ReportError as exc:
                     bot.send_message(message["chat"]["id"], f"⚠️ Cần kiểm tra thủ công: {exc}")
                 except Exception:
